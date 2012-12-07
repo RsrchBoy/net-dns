@@ -1,10 +1,10 @@
 package Net::DNS::Question;
 
 #
-# $Id: Question.pm 971 2011-12-14 10:39:30Z willem $
+# $Id: Question.pm 1040 2012-10-31 10:18:27Z willem $
 #
 use vars qw($VERSION);
-$VERSION = (qw$LastChangedRevision: 971 $)[1];
+$VERSION = (qw$LastChangedRevision: 1040 $)[1];
 
 
 =head1 NAME
@@ -29,8 +29,9 @@ use strict;
 use integer;
 use Carp;
 
-use Net::DNS;
-use Net::DNS::DomainName;
+use Net::DNS::Parameters;
+
+require Net::DNS::DomainName;
 
 
 =head1 METHODS
@@ -59,14 +60,12 @@ sub new {
 	my $qclass = uc( shift || '' );
 
 	# tolerate (possibly unknown) type and class in zone file order
-	unless ( exists $Net::DNS::classesbyname{$qclass} ) {
-		( $qtype, $qclass ) = ( $qclass, $qtype )
-				if exists $Net::DNS::classesbyname{$qtype};
+	unless ( exists $classbyname{$qclass} ) {
+		( $qtype, $qclass ) = ( $qclass, $qtype ) if exists $classbyname{$qtype};
 		( $qtype, $qclass ) = ( $qclass, $qtype ) if $qtype =~ /CLASS/;
 	}
-	unless ( exists $Net::DNS::typesbyname{$qtype} ) {
-		( $qtype, $qclass ) = ( $qclass, $qtype )
-				if exists $Net::DNS::typesbyname{$qclass};
+	unless ( exists $typebyname{$qtype} ) {
+		( $qtype, $qclass ) = ( $qclass, $qtype ) if exists $typebyname{$qclass};
 		( $qtype, $qclass ) = ( $qclass, $qtype ) if $qclass =~ /TYPE/;
 	}
 
@@ -78,9 +77,9 @@ sub new {
 		}
 	}
 
-	$self->{name}  = new Net::DNS::DomainName1035($qname);
-	$self->{type}  = Net::DNS::typesbyname( $qtype || 'A' );
-	$self->{class} = Net::DNS::classesbyname( $qclass || 'IN' );
+	$self->{owner} = new Net::DNS::DomainName1035($qname);
+	$self->{type}  = typebyname( $qtype || 'A' );
+	$self->{class} = classbyname( $qclass || 'IN' );
 
 	return $self;
 }
@@ -111,13 +110,13 @@ sub decode {
 	my $self = bless {}, shift;
 	my ( $data, $offset ) = @_;
 
-	( $self->{name}, $offset ) = decode Net::DNS::DomainName1035(@_);
+	( $self->{owner}, $offset ) = decode Net::DNS::DomainName1035(@_);
 
 	my $next = $offset + QFIXEDSZ;
 	die 'corrupt wire-format data' if length $$data < $next;
 	@{$self}{qw(type class)} = unpack "\@$offset n2", $$data;
 
-	return wantarray ? ( $self, $next ) : $self;
+	wantarray ? ( $self, $next ) : $self;
 }
 
 
@@ -137,7 +136,35 @@ table used to index compressed names within the packet.
 sub encode {
 	my $self = shift;
 
-	return pack 'a* n2', $self->{name}->encode(@_), @{$self}{qw(type class)};
+	pack 'a* n2', $self->{owner}->encode(@_), @{$self}{qw(type class)};
+}
+
+
+=head2 name
+
+    $name = $question->name;
+
+Internationalised domain name corresponding to the qname attribute.
+
+Decoding non-ASCII domain names is computationally expensive and
+undesirable for names which are likely to be used to construct
+further queries.
+
+When required to communicate with humans, the 'proper' domain name
+should be extracted from a query or reply packet.
+
+    $query = new Net::DNS::Packet( $example, 'ANY' );
+    $reply = $resolver->send($query) or die;
+    ($question) = $reply->question;
+    $name = $question->name;
+
+=cut
+
+sub name {
+	my $self = shift;
+
+	croak 'immutable object: argument invalid' if @_;
+	$self->{owner}->xname;
 }
 
 
@@ -146,16 +173,17 @@ sub encode {
     $qname = $question->qname;
     $zname = $question->zname;
 
-Returns the question name attribute.  In dynamic update packets,
-this attribute is known as zname() and refers to the zone name.
+Canonical ASCII domain name as required for the query subject
+transmitted to a nameserver.  In dynamic update packets, this
+attribute is known as zname() and refers to the zone name.
 
 =cut
 
 sub qname {
 	my $self = shift;
 
-	return $self->{name}->identifier unless @_;
-	croak 'method invoked with unexpected argument';
+	croak 'immutable object: argument invalid' if @_;
+	$self->{owner}->name;
 }
 
 sub zname { &qname; }
@@ -174,8 +202,8 @@ this attribute is known as ztype() and refers to the zone type.
 sub type {
 	my $self = shift;
 
-	return Net::DNS::typesbyval( $self->{type} ) unless @_;
-	croak 'method invoked with unexpected argument';
+	croak 'immutable object: argument invalid' if @_;
+	typebyval( $self->{type} );
 }
 
 sub qtype { &type; }
@@ -195,8 +223,8 @@ this attribute is known as zclass() and refers to the zone class.
 sub class {
 	my $self = shift;
 
-	return Net::DNS::classesbyval( $self->{class} ) unless @_;
-	croak 'method invoked with unexpected argument';
+	croak 'immutable object: argument invalid' if @_;
+	classbyval( $self->{class} );
 }
 
 sub qclass { &class; }
@@ -228,7 +256,7 @@ Returns a string representation of the question record.
 sub string {
 	my $self = shift;
 
-	return join "\t", $self->{name}->string, $self->qclass, $self->qtype;
+	join "\t", $self->{owner}->string, $self->qclass, $self->qtype;
 }
 
 
@@ -254,20 +282,22 @@ sub _dns_addr {				## Map IP address into reverse lookup namespace
 
 	# arg looks like IPv4 address: map to in-addr.arpa space
 	if (m#(^|:.*:)((^|\d+\.)+\d+)(/(\d+))?$#) {
+		return undef if new Net::DNS::DomainName('@')->label;
 		my @parse = split /\./, $2;
 		my $prefx = $5 || @parse << 3;
 		my $last = $prefx > 24 ? 3 : ( $prefx - 1 ) >> 3;
-		return join '.', reverse( ( @parse, (0) x 3 )[0 .. $last] ), 'in-addr.arpa';
+		return join '.', reverse( ( @parse, (0) x 3 )[0 .. $last] ), 'in-addr.arpa.';
 	}
 
 	# arg looks like IPv6 address: map to ip6.arpa space
 	if (m#^((\w*:)+)(\w*)(/(\d+))?$#) {
+		return undef if new Net::DNS::DomainName('@')->label;
 		my @parse = split /:/, ( reverse "0${1}0${3}" ), 9;
 		my @xpand = map { /./ ? $_ : ('0') x ( 9 - @parse ) } @parse;	 # expand ::
 		my $prefx = $5 || @xpand << 4;			# implicit length if unspecified
 		my $hex = pack 'A4' x 8, map { $_ . '000' } ('0') x ( 8 - @xpand ), @xpand;
 		my $len = $prefx > 124 ? 32 : ( $prefx + 3 ) >> 2;
-		return join '.', split( //, substr( $hex, -$len ) ), 'ip6.arpa';
+		return join '.', split( //, substr( $hex, -$len ) ), 'ip6.arpa.';
 	}
 
 	return undef;

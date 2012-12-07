@@ -1,12 +1,12 @@
 package Net::DNS;
 
 #
-# $Id: DNS.pm 981 2012-01-27 23:01:31Z willem $
+# $Id: DNS.pm 1064 2012-12-04 08:51:46Z willem $
 #
 use vars qw($SVNVERSION $VERSION);
 BEGIN {
-	$SVNVERSION = (qw$LastChangedRevision: 981 $)[1];
-	$VERSION = '0.68';
+	$SVNVERSION = (qw$LastChangedRevision: 1064 $)[1];
+	$VERSION = '0.69';
 }
 
 
@@ -92,24 +92,31 @@ BEGIN {
 BEGIN {
 
     $DNSSEC = eval {
-	    local $SIG{'__DIE__'} = 'DEFAULT';
-	    require Net::DNS::SEC;
-	    1
-	    } ? 1 : 0;
+		local $SIG{'__DIE__'} = 'DEFAULT';
+		require Net::DNS::SEC;
+		} ? 1 : 0;
 
-
+	if ( $DNSSEC ) {
+		eval { require Net::DNS::RR::DLV };
+		eval { require Net::DNS::RR::DNSKEY };
+		eval { require Net::DNS::RR::DS };
+		eval { require Net::DNS::RR::KEY };
+		eval { require Net::DNS::RR::NSEC };
+		eval { require Net::DNS::RR::NSEC3 };
+		eval { require Net::DNS::RR::NSEC3PARAM };
+		eval { require Net::DNS::RR::NXT };
+		eval { require Net::DNS::RR::RRSIG };
+		eval { require Net::DNS::RR::SIG };
+	}
 }
 
 
 use strict;
 use Carp;
-use Net::DNS::Resolver;
+use Net::DNS::RR;
 use Net::DNS::Packet;
 use Net::DNS::Update;
-use Net::DNS::Header;
-use Net::DNS::Question;
-use Net::DNS::RR;   # use only after $Net::DNS::DNSSEC has been evaluated
-
+use Net::DNS::Resolver;
 
 
 #
@@ -174,7 +181,8 @@ use Net::DNS::RR;   # use only after $Net::DNS::DNSSEC has been evaluated
     'DHCID'     => 49,      # RFC4701
     'NSEC3'     => 50,      # RFC5155
     'NSEC3PARAM' => 51,     # RFC5155
-# 52-54 are unassigned
+    'TLSA'	=> 52,      # RFC6698
+# 53-54 are unassigned
     'HIP'       => 55,      # RFC5205
     'NINFO'     => 56,      # non-standard					NOT IMPLEMENTED
     'RKEY'      => 57,      # non-standard					NOT IMPLEMENTED
@@ -312,7 +320,7 @@ sub classesbyval {
     'QUERY'        => 0,        # RFC 1035
     'IQUERY'       => 1,        # RFC 1035
     'STATUS'       => 2,        # RFC 1035
-    'NS_NOTIFY_OP' => 4,        # RFC 1996
+    'NOTIFY'       => 4,        # RFC 1996
     'UPDATE'       => 5,        # RFC 2136
 );
 %opcodesbyval = reverse %opcodesbyname;
@@ -376,17 +384,40 @@ sub mx {
 # Auxiliary functions to support dynamic update.
 #
 
-sub yxrrset { return new Net::DNS::RR( shift, 'yxrrset' ); }
+sub yxrrset {
+	my $rr = new Net::DNS::RR(shift);
+	$rr->class('ANY') unless $rr->rdata;
+	return $rr;
+}
 
-sub nxrrset { return new Net::DNS::RR( shift, 'nxrrset' ); }
+sub nxrrset {
+	my $rr = new Net::DNS::RR(shift);
+	$rr->class('NONE');
+	return $rr;
+}
 
-sub yxdomain { return new Net::DNS::RR( shift, 'yxdomain' ); }
+sub yxdomain {
+	my ($domain) = split /\s+/, shift;
+	return new Net::DNS::RR("$domain ANY ANY");
+}
 
-sub nxdomain { return new Net::DNS::RR( shift, 'nxdomain' ); }
+sub nxdomain {
+	my ($domain) = split /\s+/, shift;
+	return new Net::DNS::RR("$domain NONE ANY");
+}
 
-sub rr_add { return new Net::DNS::RR( shift, 'rr_add' ); }
+sub rr_add {
+	my $rr = new Net::DNS::RR(shift);
+	$rr->{ttl} ||= 86400;
+	return $rr;
+}
 
-sub rr_del { return new Net::DNS::RR( shift, 'rr_del' ); }
+sub rr_del {
+	my ( $head, @tail ) = split /\s+/, shift;
+	my $rr = new Net::DNS::RR( scalar @tail > 1 ? "$head @tail": "$head ANY @tail" );
+	$rr->class( $rr->rdata ? 'NONE' : 'ANY' );
+	return $rr;
+}
 
 
 
@@ -417,43 +448,15 @@ sub name2labels {
 
 
 sub wire2presentation {
-    my  $wire=shift;
-    my  $presentation="";
-    my $length=length($wire);
-    # There must be a nice regexp to do this.. but since I failed to
-    # find one I scan the name string until I find a '\', at that time
-    # I start looking forward and do the magic.
+    my $presentation=shift; # Really wire...
 
-    my $i=0;
+    # Prepend these with a backslash
+    $presentation =~ s/(["$();@.\\])/\\$1/g;
 
-    while ($i < $length ){
-	my $char=unpack("x".$i."C1",$wire);
-	if ( $char < 33 || $char > 126 ){
-	    $presentation.= sprintf ("\\%03u" ,$char);
-	}elsif ( $char == ord( "\"" )) {
-	    $presentation.= "\\\"";
-	}elsif ( $char == ord( "\$" )) {
-	    $presentation.= "\\\$";
-	}elsif ( $char == ord( "(" )) {
-	    $presentation.= "\\(";
-	}elsif ( $char == ord( ")" )) {
-	    $presentation.= "\\)";
-	}elsif ( $char == ord( ";" )) {
-	    $presentation.= "\\;";
-	}elsif ( $char == ord( "@" )) {
-	    $presentation.= "\\@";
-	}elsif ( $char == ord( "\\" )) {
-	    $presentation.= "\\\\" ;
-	}elsif ( $char==ord (".") ){
-	    $presentation.= "\\." ;
-	}else{
-	    $presentation.=chr($char) 	;
-	}
-	$i++;
-    }
+    # Convert < 33 and > 126 to \x<\d\d\d>
+    $presentation =~ s/([^\x21-\x7E])/sprintf("\\%03u", ord($1))/eg; 
 
     return $presentation;
-
 }
 
 
