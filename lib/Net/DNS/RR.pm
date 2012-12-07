@@ -162,6 +162,9 @@ If omitted, C<ttl> defaults to 0 and C<class> defaults to IN.
 Omitting the optional fields is useful for creating the empty RDATA
 sections required for certain dynamic update operations.
 
+The older new_from_hash() constructor will still work; it just delegates to
+new() directly.
+
 =cut
 
 sub new_hash {
@@ -198,6 +201,7 @@ sub new_hash {
 	return $self;
 }
 
+sub new_from_hash   { warn 'in new_from_hash()'; shift->new_hash(@_)   }
 
 =head2 decode
 
