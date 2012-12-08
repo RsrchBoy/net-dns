@@ -1,26 +1,23 @@
 # $Id: 00-pod.t 1068 2012-12-06 10:38:51Z willem $
 
-use Test::More;
-use File::Spec;
-use File::Find;
 use strict;
+use warnings;
 
-eval "use Test::Pod 0.95";
-
-if ($@) {
-	plan skip_all => "Test::Pod v0.95 required for testing POD";
-} else {
-	Test::Pod->import;
-	
-	my @files;
-	my $blib = File::Spec->catfile(qw(blib lib));
-	
-	find( sub { push(@files, $File::Find::name) if /\.p(l|m|od)$/}, $blib);
-
-	plan tests => scalar @files;
-
-	foreach my $file (@files) {
-		pod_file_ok($file);
-	}
+# test iff we're a in release testing
+BEGIN {
+  unless ($ENV{RELEASE_TESTING}) {
+    require Test::More;
+    Test::More::plan(skip_all => 'these tests are for release candidate testing');
+  }
 }
 
+use Test::More;
+
+# test iff we have a recent level of Test::Pod
+use Test::Requires {
+    'Test::Pod' => '1.00',
+};
+
+all_pod_files_ok();
+
+done_testing;
